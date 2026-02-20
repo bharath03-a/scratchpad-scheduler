@@ -82,7 +82,7 @@ fn compute_working_set_with_granularity(
 }
 
 /// Helper: Find best granularity for a group of ops
-/// Tries native granularity first, then smaller tiles if needed
+/// Uses binary search for optimal tile size
 fn find_best_granularity(
     problem: &Problem,
     ops: &[usize],
@@ -101,7 +101,7 @@ fn find_best_granularity(
     for &op_idx in ops {
         if problem.op_types[op_idx] == "MatMul" {
             k = get_matmul_k(problem, op_idx);
-            break; // Use first MatMul's k (simplified)
+            break;
         }
     }
 
@@ -115,32 +115,70 @@ fn find_best_granularity(
         return (granularity, working_set);
     }
 
-    // Need to tile: try smaller granularities
+    // Binary search for optimal w and h
     let mut best_granularity = granularity;
     let mut best_working_set = working_set;
 
-    // Try halving dimensions
-    for scale in [2, 4, 8, 16].iter() {
-        let w_tile = (out_w / scale).max(native_w);
-        let h_tile = (out_h / scale).max(native_h);
-        let test_granularity = [w_tile, h_tile, k];
+    // Binary search for w
+    let mut w_low = native_w;
+    let mut w_high = out_w;
+    while w_low < w_high {
+        let w_mid = (w_low + w_high + 1) / 2;
+        let test_granularity = [w_mid, h, k];
         let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
+        
+        if test_ws <= problem.fast_memory_capacity {
+            w_low = w_mid;
+            if test_ws < best_working_set {
+                best_granularity = test_granularity;
+                best_working_set = test_ws;
+            }
+        } else {
+            w_high = w_mid - 1;
+        }
+    }
 
-        if test_ws <= problem.fast_memory_capacity && test_ws < best_working_set {
-            best_granularity = test_granularity;
-            best_working_set = test_ws;
+    // Binary search for h
+    let w_opt = best_granularity[0];
+    let mut h_low = native_h;
+    let mut h_high = out_h;
+    while h_low < h_high {
+        let h_mid = (h_low + h_high + 1) / 2;
+        let test_granularity = [w_opt, h_mid, k];
+        let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
+        
+        if test_ws <= problem.fast_memory_capacity {
+            h_low = h_mid;
+            if test_ws < best_working_set {
+                best_granularity = test_granularity;
+                best_working_set = test_ws;
+            }
+        } else {
+            h_high = h_mid - 1;
         }
     }
 
     // If still doesn't fit, try split-K for MatMul
     if best_working_set > problem.fast_memory_capacity && k > 1 {
-        for k_split in [2, 4, 8, 16].iter() {
-            let k_tile = (k / k_split).max(1);
-            let test_granularity = [w, h, k_tile];
+        let w_opt = best_granularity[0];
+        let h_opt = best_granularity[1];
+        
+        // Binary search for k
+        let mut k_low = 1;
+        let mut k_high = k;
+        while k_low < k_high {
+            let k_mid = (k_low + k_high + 1) / 2;
+            let test_granularity = [w_opt, h_opt, k_mid];
             let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
-
+            
             if test_ws <= problem.fast_memory_capacity {
-                return (test_granularity, test_ws);
+                k_low = k_mid;
+                if test_ws < best_working_set {
+                    best_granularity = test_granularity;
+                    best_working_set = test_ws;
+                }
+            } else {
+                k_high = k_mid - 1;
             }
         }
     }
@@ -155,11 +193,58 @@ fn num_tiles(tensor_w: i64, tensor_h: i64, tile_w: i64, tile_h: i64) -> i64 {
     tiles_w * tiles_h
 }
 
-/// Helper: Compute latency for a grouped subgraph with granularity
+/// Helper: Generate optimal traversal order for MatMul (zig-zag pattern)
+/// Returns None for non-MatMul or when traversal doesn't help
+fn generate_traversal_order(
+    problem: &Problem,
+    ops: &[usize],
+    granularity: [i64; 3],
+) -> Option<Vec<i64>> {
+    // Only optimize for MatMul operations
+    if !ops.iter().any(|&op_idx| problem.op_types[op_idx] == "MatMul") {
+        return None;
+    }
+
+    let [w, h, _k] = granularity;
+    let last_op = ops[ops.len() - 1];
+    let out_tid = problem.outputs[last_op][0];
+    let out_w = problem.widths[out_tid];
+    let out_h = problem.heights[out_tid];
+
+    let tiles_w = (out_w + w - 1) / w;
+    let tiles_h = (out_h + h - 1) / h;
+    let total_tiles = tiles_w * tiles_h;
+
+    // For small number of tiles, traversal order doesn't matter much
+    if total_tiles <= 4 {
+        return None;
+    }
+
+    // Generate zig-zag (snake) pattern: row 0: 0,1,2... row 1: ...2,1,0
+    let mut order = Vec::new();
+    for row in 0..tiles_h {
+        if row % 2 == 0 {
+            // Left to right
+            for col in 0..tiles_w {
+                order.push((row * tiles_w + col) as i64);
+            }
+        } else {
+            // Right to left
+            for col in (0..tiles_w).rev() {
+                order.push((row * tiles_w + col) as i64);
+            }
+        }
+    }
+
+    Some(order)
+}
+
+/// Helper: Compute latency for a grouped subgraph with granularity and traversal order
 fn compute_group_latency_with_granularity(
     problem: &Problem,
     ops: &[usize],
     granularity: [i64; 3],
+    traversal_order: &Option<Vec<i64>>,
 ) -> f64 {
     let [w, h, k] = granularity;
     let bandwidth = problem.slow_memory_bandwidth as f64;
@@ -184,32 +269,36 @@ fn compute_group_latency_with_granularity(
         }
     }
 
-    // Graph inputs: consumed but not produced by this group
+    // Compute memory time accounting for traversal order optimization
     let mut memory_time_in = 0.0;
-    for &tensor_id in &consumed_tensors {
-        if !produced_tensors.contains(&tensor_id) {
-            let tensor_w = problem.widths[tensor_id];
-            let tensor_h = problem.heights[tensor_id];
-            
-            // Compute how many tiles we need to load
-            let tiles = if problem.op_types.iter().any(|ot| ot == "MatMul") {
-                // For MatMul, inputs might be sliced differently
-                // Simplified: use w*h for pointwise inputs, k-based for MatMul
-                num_tiles(tensor_w, tensor_h, w, h)
-            } else {
-                num_tiles(tensor_w, tensor_h, w, h)
-            };
-            
-            let tile_size = if problem.op_types.iter().any(|ot| ot == "MatMul") && 
-                              problem.inputs.iter().any(|ins| ins.contains(&tensor_id)) {
-                // MatMul input: depends on which side
-                // Simplified: use w*h as approximation
-                w * h
-            } else {
-                w * h
-            };
-            
-            memory_time_in += (tiles * tile_size) as f64 / bandwidth;
+    
+    // If we have traversal order, we can reuse data between tiles
+    let has_traversal_opt = traversal_order.is_some() && 
+                            ops.iter().any(|&op_idx| problem.op_types[op_idx] == "MatMul");
+    
+    if has_traversal_opt {
+        // With zig-zag traversal, we can reuse row/column strips
+        // Simplified model: assume 50% data reuse on average
+        for &tensor_id in &consumed_tensors {
+            if !produced_tensors.contains(&tensor_id) {
+                let tensor_w = problem.widths[tensor_id];
+                let tensor_h = problem.heights[tensor_id];
+                let tiles = num_tiles(tensor_w, tensor_h, w, h);
+                let tile_size = w * h;
+                // Assume 50% reuse with zig-zag pattern
+                memory_time_in += (tiles * tile_size * 3 / 4) as f64 / bandwidth;
+            }
+        }
+    } else {
+        // Standard case: no traversal optimization
+        for &tensor_id in &consumed_tensors {
+            if !produced_tensors.contains(&tensor_id) {
+                let tensor_w = problem.widths[tensor_id];
+                let tensor_h = problem.heights[tensor_id];
+                let tiles = num_tiles(tensor_w, tensor_h, w, h);
+                let tile_size = w * h;
+                memory_time_in += (tiles * tile_size) as f64 / bandwidth;
+            }
         }
     }
 
@@ -312,6 +401,30 @@ fn count_tensor_usage(problem: &Problem) -> HashMap<usize, usize> {
     usage_count
 }
 
+/// Helper: Compute cost of recomputing a tensor vs retaining it
+/// Returns (recompute_cost, retain_cost)
+fn compute_recompute_vs_retain_cost(
+    problem: &Problem,
+    tensor_id: usize,
+    producer_op: usize,
+) -> (f64, f64) {
+    let size = tensor_size(problem, tensor_id) as f64;
+    let bandwidth = problem.slow_memory_bandwidth as f64;
+    
+    // Cost to recompute: compute cost of producer op + input memory cost
+    let mut recompute_cost = problem.base_costs[producer_op] as f64;
+    for &in_tid in &problem.inputs[producer_op] {
+        let in_size = tensor_size(problem, in_tid) as f64;
+        recompute_cost += in_size / bandwidth;
+    }
+    
+    // Cost to retain: memory transfer cost (load once, keep in fast memory)
+    // Plus opportunity cost of using fast memory capacity
+    let retain_cost = size / bandwidth;
+    
+    (recompute_cost, retain_cost)
+}
+
 /// Main scheduler with all optimizations
 pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
     let n_ops = problem.op_types.len();
@@ -329,7 +442,7 @@ pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
     // Track which ops are scheduled
     let mut scheduled = vec![false; n_ops];
     
-    // More aggressive grouping: try to form larger groups
+    // More aggressive grouping: try to form larger groups with look-ahead
     for &op_idx in &topo_order {
         if scheduled[op_idx] {
             continue;
@@ -339,7 +452,7 @@ pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
         let mut current_group = vec![op_idx];
         scheduled[op_idx] = true;
 
-        // Try to extend the group greedily
+        // Try to extend the group greedily with look-ahead
         loop {
             let mut extended = false;
             
@@ -354,6 +467,17 @@ pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
                     }
                 }
             }
+            
+            // Sort candidates by potential benefit (look-ahead heuristic)
+            // Prefer ops that allow further grouping
+            candidates.sort_by_key(|&consumer| {
+                let mut lookahead_score = 0;
+                if let Some(consumer_list) = consumers.get(&consumer) {
+                    lookahead_score = consumer_list.len();
+                }
+                // Negative for max-heap behavior (we want more consumers first)
+                -(lookahead_score as i32)
+            });
             
             // Try each candidate
             for consumer in candidates {
@@ -377,29 +501,57 @@ pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
 
         // Finalize this group
         let (granularity, _working_set) = find_best_granularity(problem, &current_group);
-        let latency = compute_group_latency_with_granularity(problem, &current_group, granularity);
+        
+        // Generate optimal traversal order
+        let traversal_order = generate_traversal_order(problem, &current_group, granularity);
+        
+        let latency = compute_group_latency_with_granularity(
+            problem, 
+            &current_group, 
+            granularity,
+            &traversal_order
+        );
 
         // Determine tensors to retain (for skip connections)
+        // Use cost-based decision: recompute vs retain
         let mut retain = Vec::new();
+        let mut remaining_capacity = problem.fast_memory_capacity;
+        
+        // Collect candidate tensors with their costs
+        let mut candidates = Vec::new();
         for &op_idx in &current_group {
             for &out_tid in &problem.outputs[op_idx] {
-                // Retain if tensor is used multiple times and fits
                 if let Some(&usage) = tensor_usage.get(&out_tid) {
                     if usage > 1 {
+                        let (recompute_cost, retain_cost) = 
+                            compute_recompute_vs_retain_cost(problem, out_tid, op_idx);
                         let size = tensor_size(problem, out_tid);
-                        // Simple heuristic: retain if small enough
-                        if size < problem.fast_memory_capacity / 4 {
-                            retain.push(out_tid);
-                        }
+                        
+                        candidates.push((out_tid, size, recompute_cost, retain_cost, usage));
                     }
                 }
+            }
+        }
+        
+        // Sort by benefit: (recompute_cost - retain_cost) / size (benefit per unit memory)
+        candidates.sort_by(|a, b| {
+            let benefit_a = (a.2 - a.3) / (a.1 as f64 + 1.0);
+            let benefit_b = (b.2 - b.3) / (b.1 as f64 + 1.0);
+            benefit_b.partial_cmp(&benefit_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Greedily retain tensors that provide benefit and fit
+        for (tensor_id, size, recompute_cost, retain_cost, _usage) in candidates {
+            if retain_cost < recompute_cost && size <= remaining_capacity {
+                retain.push(tensor_id);
+                remaining_capacity -= size;
             }
         }
 
         subgraphs.push(current_group);
         granularities.push(granularity);
         tensors_to_retain.push(retain);
-        traversal_orders.push(None); // Could optimize later
+        traversal_orders.push(traversal_order);
         subgraph_latencies.push(latency);
     }
 
