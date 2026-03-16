@@ -1,558 +1,858 @@
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::problem::Problem;
 use crate::solution::Solution;
 
-/// Helper: Compute tensor size in elements
-fn tensor_size(problem: &Problem, tensor_id: usize) -> i64 {
-    problem.widths[tensor_id] * problem.heights[tensor_id]
+// ===== HELPERS =====
+
+fn ceil_div(a: i64, b: i64) -> i64 {
+    (a + b - 1) / b
 }
 
-/// Helper: Get reduction dimension K for MatMul
-/// For MatMul: inputs[0] is LHS (H x K), inputs[1] is RHS (K x W)
-/// K is the common dimension (width of LHS = height of RHS)
-fn get_matmul_k(problem: &Problem, op_idx: usize) -> i64 {
-    if problem.inputs[op_idx].len() < 2 {
-        return 1;
-    }
+/// K_full for a MatMul op = width of LHS tensor (reduction dimension = k parameter in spec).
+fn matmul_k_full(problem: &Problem, op_idx: usize) -> i64 {
     let lhs_id = problem.inputs[op_idx][0];
-    let rhs_id = problem.inputs[op_idx][1];
-    // K = width of LHS = height of RHS
-    problem.widths[lhs_id].min(problem.heights[rhs_id])
+    problem.widths[lhs_id]
 }
 
-/// Helper: Compute working set size for a subgraph with given granularity
-/// This accounts for tiling - only the slices needed per tile are in memory
-fn compute_working_set_with_granularity(
+/// Classify tensors in a subgraph:
+/// - boundary_inputs: consumed by ops in group but NOT produced by any op in group
+/// - final_outputs: produced by ops in group AND either a graph output or consumed outside group
+/// - ephemeral: produced by one op in group and consumed by another op in group
+fn classify_boundary(
     problem: &Problem,
     ops: &[usize],
-    granularity: [i64; 3],
-) -> i64 {
-    let [w, h, k] = granularity;
-    let mut working_set = 0i64;
+    tensor_to_producer: &HashMap<usize, usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let op_set: HashSet<usize> = ops.iter().cloned().collect();
 
-    // Collect all tensors used
-    let mut input_tensors = HashSet::new();
-    let mut output_tensors = HashSet::new();
-
-    for &op_idx in ops {
-        for &tid in &problem.inputs[op_idx] {
-            input_tensors.insert(tid);
-        }
-        for &tid in &problem.outputs[op_idx] {
-            output_tensors.insert(tid);
+    // tensors produced within the group
+    let mut produced: HashSet<usize> = HashSet::new();
+    for &op in ops {
+        for &t in &problem.outputs[op] {
+            produced.insert(t);
         }
     }
 
-    // For each output tensor: need w * h slice
-    for _tid in &output_tensors {
-        working_set += w * h;
-    }
-
-    // For each input tensor: depends on op type
-    for &op_idx in ops {
-        let op_type = &problem.op_types[op_idx];
-        
-        if op_type == "MatMul" {
-            // MatMul: LHS needs h * k, RHS needs w * k
-            if problem.inputs[op_idx].len() >= 2 {
-                let lhs_id = problem.inputs[op_idx][0];
-                let rhs_id = problem.inputs[op_idx][1];
-                
-                // Only count if not already counted as output from another op in group
-                if !output_tensors.contains(&lhs_id) {
-                    working_set += h * k;
-                }
-                if !output_tensors.contains(&rhs_id) {
-                    working_set += w * k;
-                }
-            }
-        } else {
-            // Pointwise: inputs need w * h slice
-            for &tid in &problem.inputs[op_idx] {
-                if !output_tensors.contains(&tid) {
-                    working_set += w * h;
-                }
-            }
+    // tensors consumed within the group
+    let mut consumed_within: HashSet<usize> = HashSet::new();
+    for &op in ops {
+        for &t in &problem.inputs[op] {
+            consumed_within.insert(t);
         }
     }
 
-    working_set
+    // boundary_inputs: consumed but not produced within group
+    let mut boundary_inputs: Vec<usize> = consumed_within
+        .iter()
+        .filter(|&&t| !produced.contains(&t))
+        .cloned()
+        .collect();
+    boundary_inputs.sort();
+    boundary_inputs.dedup();
+
+    // final_outputs: produced by group but not consumed by any op in the group
+    // (i.e., must eventually be written to slow memory)
+    let mut final_outputs: Vec<usize> = produced
+        .iter()
+        .filter(|&&t| {
+            // check if consumed by any op OUTSIDE the group
+            // if a tensor is only consumed within the group → ephemeral, skip
+            let consumed_outside = (0..problem.op_types.len()).any(|other_op| {
+                !op_set.contains(&other_op)
+                    && problem.inputs[other_op].contains(&t)
+            });
+            // also include if it's a graph output (not consumed by any op)
+            let is_graph_output = !problem.inputs.iter().any(|inputs| inputs.contains(&t));
+            consumed_outside || is_graph_output
+        })
+        .cloned()
+        .collect();
+    final_outputs.sort();
+    final_outputs.dedup();
+
+    (boundary_inputs, final_outputs)
 }
 
-/// Helper: Find best granularity for a group of ops
-/// Uses binary search for optimal tile size
-fn find_best_granularity(
+/// The "primary" output tensor for spatial tiling: the output of the last op in the group
+fn primary_output_tensor(problem: &Problem, ops: &[usize]) -> usize {
+    // Use last op's first output
+    let last_op = *ops.last().unwrap();
+    problem.outputs[last_op][0]
+}
+
+// ===== WORKING SET COMPUTATION =====
+
+/// Compute the peak working set size in fast memory for one execution step.
+///
+/// Correct model (validated against problem examples):
+///
+/// For MatMul groups (including chains):
+///   - First boundary MatMul LHS: kept FULLY resident per spatial tile = h × K_full
+///     where K_full = problem.widths[lhs_tensor] (full reduction dimension)
+///   - Each boundary MatMul RHS: one k-strip at a time = k × w
+///   - Output accumulator: h × w
+///   - Any additional Pointwise boundary inputs: h × w each
+///
+/// For Pointwise-only groups:
+///   - Each boundary input: h × w
+///   - Output: h × w
+pub fn compute_working_set(problem: &Problem, ops: &[usize], gran: [i64; 3]) -> i64 {
+    let [w, h, k] = gran;
+
+    // Tensors produced within the group (ephemeral — never loaded from slow mem)
+    let produced: HashSet<usize> = ops.iter()
+        .flat_map(|&op| problem.outputs[op].iter().cloned())
+        .collect();
+
+    // Output accumulator/tile
+    let mut ws: i64 = w * h;
+    let mut counted: HashSet<usize> = HashSet::new();
+
+    let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
+
+    if has_matmul {
+        // Find ALL boundary MatMul LHS tensors (not produced within the group).
+        // Each non-ephemeral LHS is kept fully resident (h × K_full) during k-steps.
+        // Multiple parallel chains in a merged group each need their own LHS resident.
+        for &op in ops {
+            if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
+                let lhs_id = problem.inputs[op][0];
+                if !produced.contains(&lhs_id) && !counted.contains(&lhs_id) {
+                    // LHS kept fully resident during k-steps: h × K_full
+                    // K_full = widths[lhs] (reduction dim)
+                    let k_full = problem.widths[lhs_id];
+                    ws += h * k_full;
+                    counted.insert(lhs_id);
+                    // No break: count ALL non-ephemeral LHS tensors
+                }
+            }
+        }
+
+        // Each boundary RHS: one k-strip at a time = k × w
+        for &op in ops {
+            if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
+                let rhs_id = problem.inputs[op][1];
+                if !produced.contains(&rhs_id) && !counted.contains(&rhs_id) {
+                    ws += k * w;
+                    counted.insert(rhs_id);
+                }
+            }
+        }
+    }
+
+    // Pointwise boundary inputs (and non-MatMul inputs): h × w tile each
+    for &op in ops {
+        for &t in &problem.inputs[op] {
+            if !produced.contains(&t) && !counted.contains(&t) {
+                ws += w * h;
+                counted.insert(t);
+            }
+        }
+    }
+
+    ws
+}
+
+// ===== LATENCY COMPUTATION =====
+
+/// Compute total subgraph latency with the given granularity and traversal order.
+///
+/// Key model (validated against reference examples):
+/// - Spatial tiles: tiles_w × tiles_h over the output tensor
+/// - Split-K steps: k_steps = ceil(K_full / k) per spatial tile
+/// - Compute per k-step = sum(base_costs) / k_steps  (constant regardless of tile size)
+/// - Memory per non-last k-step: (lhs_slice + rhs_slice) / bw
+/// - Memory per last k-step: (lhs_slice + rhs_slice + out_slice) / bw
+/// - Tile latency = max(compute_per_step, memory_per_step)
+/// - Total = sum over all (spatial_tile, k_step)
+///
+/// For zig-zag traversal (MatMul, k=K_full, no split-K):
+/// - First tile: load LHS + RHS + write Out
+/// - Within-row col change: load RHS + write Out
+/// - Row transition: load LHS + write Out
+pub fn compute_latency(
     problem: &Problem,
     ops: &[usize],
-) -> ([i64; 3], i64) {
+    gran: [i64; 3],
+    use_zigzag: bool,
+    resident_tensors: &HashSet<usize>,
+) -> f64 {
+    let [w, h, k] = gran;
+    let bw = problem.slow_memory_bandwidth as f64;
     let native_w = problem.native_granularity[0];
     let native_h = problem.native_granularity[1];
 
-    // Determine output tensor shape (use last op's output)
-    let last_op = ops[ops.len() - 1];
-    let out_tid = problem.outputs[last_op][0];
-    let out_w = problem.widths[out_tid];
-    let out_h = problem.heights[out_tid];
+    let dummy_producer: HashMap<usize, usize> = HashMap::new();
+    let (boundary_inputs, final_outputs) = classify_boundary(problem, ops, &dummy_producer);
 
-    // Determine k dimension
-    let mut k = 1i64;
-    for &op_idx in ops {
-        if problem.op_types[op_idx] == "MatMul" {
-            k = get_matmul_k(problem, op_idx);
-            break;
-        }
+    let out_tensor = primary_output_tensor(problem, ops);
+    let out_w = problem.widths[out_tensor];
+    let out_h = problem.heights[out_tensor];
+
+    let tiles_w = ceil_div(out_w, w);
+    let tiles_h = ceil_div(out_h, h);
+    let total_spatial = tiles_w * tiles_h;
+
+    // Total base cost: paid per native tile × scaling for sub-native padding
+    // When w ≤ native_w and h ≤ native_h: each spatial tile pays full native cost
+    // When w > native_w or h > native_h: multiple native tiles per spatial tile
+    let native_tiles_per_spatial =
+        ceil_div(w, native_w).max(1) * ceil_div(h, native_h).max(1);
+    let base_cost: f64 = ops.iter().map(|&op| problem.base_costs[op] as f64).sum::<f64>()
+        * native_tiles_per_spatial as f64;
+
+    let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
+
+    if !has_matmul {
+        // === POINTWISE-ONLY ===
+        // Count boundary inputs not already resident
+        let mem_in_per_tile: f64 = boundary_inputs
+            .iter()
+            .filter(|&&t| !resident_tensors.contains(&t))
+            .count() as f64
+            * (w * h) as f64
+            / bw;
+
+        // Count final outputs (write to slow memory)
+        let mem_out_per_tile: f64 = final_outputs.len() as f64 * (w * h) as f64 / bw;
+
+        let lat_per_tile = base_cost.max(mem_in_per_tile + mem_out_per_tile);
+        return total_spatial as f64 * lat_per_tile;
     }
 
-    // Try native granularity first
-    let w = out_w.min(native_w);
-    let h = out_h.min(native_h);
-    let granularity = [w, h, k];
-    let working_set = compute_working_set_with_granularity(problem, ops, granularity);
+    // === MATMUL (or mixed MatMul+Pointwise) ===
+    let matmul_op = *ops.iter().find(|&&op| problem.op_types[op] == "MatMul").unwrap();
+    let k_full = matmul_k_full(problem, matmul_op);
+    let k_steps = ceil_div(k_full, k);
 
-    if working_set <= problem.fast_memory_capacity {
-        return (granularity, working_set);
-    }
+    // Compute per k-step per spatial tile
+    let compute_per_kstep = base_cost / k_steps as f64;
 
-    // Binary search for optimal w and h
-    let mut best_granularity = granularity;
-    let mut best_working_set = working_set;
+    let out_slice = h * w;
 
-    // Binary search for w
-    let mut w_low = native_w;
-    let mut w_high = out_w;
-    while w_low < w_high {
-        let w_mid = (w_low + w_high + 1) / 2;
-        let test_granularity = [w_mid, h, k];
-        let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
-        
-        if test_ws <= problem.fast_memory_capacity {
-            w_low = w_mid;
-            if test_ws < best_working_set {
-                best_granularity = test_granularity;
-                best_working_set = test_ws;
-            }
-        } else {
-            w_high = w_mid - 1;
-        }
-    }
+    // Tensors produced within the group (ephemeral — never loaded from slow mem)
+    let produced: HashSet<usize> = ops.iter()
+        .flat_map(|&op| problem.outputs[op].iter().cloned())
+        .collect();
 
-    // Binary search for h
-    let w_opt = best_granularity[0];
-    let mut h_low = native_h;
-    let mut h_high = out_h;
-    while h_low < h_high {
-        let h_mid = (h_low + h_high + 1) / 2;
-        let test_granularity = [w_opt, h_mid, k];
-        let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
-        
-        if test_ws <= problem.fast_memory_capacity {
-            h_low = h_mid;
-            if test_ws < best_working_set {
-                best_granularity = test_granularity;
-                best_working_set = test_ws;
-            }
-        } else {
-            h_high = h_mid - 1;
-        }
-    }
-
-    // If still doesn't fit, try split-K for MatMul
-    if best_working_set > problem.fast_memory_capacity && k > 1 {
-        let w_opt = best_granularity[0];
-        let h_opt = best_granularity[1];
-        
-        // Binary search for k
-        let mut k_low = 1;
-        let mut k_high = k;
-        while k_low < k_high {
-            let k_mid = (k_low + k_high + 1) / 2;
-            let test_granularity = [w_opt, h_opt, k_mid];
-            let test_ws = compute_working_set_with_granularity(problem, ops, test_granularity);
-            
-            if test_ws <= problem.fast_memory_capacity {
-                k_low = k_mid;
-                if test_ws < best_working_set {
-                    best_granularity = test_granularity;
-                    best_working_set = test_ws;
+    // ALL boundary MatMul LHS tensors: each loaded FULLY once per spatial tile = h × K_full
+    // (kept resident across all k-steps for that spatial tile).
+    // Multiple parallel chains in a merged group each contribute their LHS load cost.
+    // For zig-zag: all LHS tensors are reloaded at each new row, reused within a row.
+    let mut total_lhs_full: i64 = 0;
+    let mut has_any_lhs = false;
+    let mut counted_lat: HashSet<usize> = HashSet::new();
+    for &op in ops {
+        if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
+            let lhs_id = problem.inputs[op][0];
+            if !produced.contains(&lhs_id) && !counted_lat.contains(&lhs_id) {
+                if !resident_tensors.contains(&lhs_id) {
+                    total_lhs_full += h * problem.widths[lhs_id]; // h × K_full
                 }
-            } else {
-                k_high = k_mid - 1;
+                has_any_lhs = true;
+                counted_lat.insert(lhs_id);
+                // No break: count ALL non-ephemeral LHS tensors
             }
         }
     }
 
-    (best_granularity, best_working_set)
-}
-
-/// Helper: Compute number of tiles needed for a granularity
-fn num_tiles(tensor_w: i64, tensor_h: i64, tile_w: i64, tile_h: i64) -> i64 {
-    let tiles_w = (tensor_w + tile_w - 1) / tile_w;
-    let tiles_h = (tensor_h + tile_h - 1) / tile_h;
-    tiles_w * tiles_h
-}
-
-/// Helper: Generate optimal traversal order for MatMul (zig-zag pattern)
-/// Returns None for non-MatMul or when traversal doesn't help
-fn generate_traversal_order(
-    problem: &Problem,
-    ops: &[usize],
-    granularity: [i64; 3],
-) -> Option<Vec<i64>> {
-    // Only optimize for MatMul operations
-    if !ops.iter().any(|&op_idx| problem.op_types[op_idx] == "MatMul") {
-        return None;
+    // Sum all boundary RHS strips (k × w each, streamed per k-step)
+    let mut rhs_strips_total: i64 = 0;
+    let mut first_rhs_strip: i64 = 0;
+    let mut first_rhs_counted = false;
+    for &op in ops {
+        if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
+            let rhs_id = problem.inputs[op][1];
+            if !produced.contains(&rhs_id) && !counted_lat.contains(&rhs_id) {
+                let rhs_eff = if resident_tensors.contains(&rhs_id) { 0 } else { k * w };
+                rhs_strips_total += rhs_eff;
+                if !first_rhs_counted {
+                    first_rhs_strip = rhs_eff;
+                    first_rhs_counted = true;
+                }
+                counted_lat.insert(rhs_id);
+            }
+        }
     }
 
-    let [w, h, _k] = granularity;
-    let last_op = ops[ops.len() - 1];
-    let out_tid = problem.outputs[last_op][0];
-    let out_w = problem.widths[out_tid];
-    let out_h = problem.heights[out_tid];
+    // Pointwise boundary inputs: loaded once per spatial tile (in last k-step with output)
+    // These are any boundary inputs not already counted as MatMul LHS or RHS.
+    let pointwise_boundary: i64 = boundary_inputs
+        .iter()
+        .filter(|&&t| !counted_lat.contains(&t) && !resident_tensors.contains(&t))
+        .count() as i64
+        * h * w;
 
-    let tiles_w = (out_w + w - 1) / w;
-    let tiles_h = (out_h + h - 1) / h;
-    let total_tiles = tiles_w * tiles_h;
+    // Zig-zag eligibility: need multiple column tiles for LHS reuse
+    // For k_steps==1 (single-step MatMul): zig-zag enables BOTH LHS reuse (within row)
+    //   AND RHS reuse (across row transitions).
+    // For k_steps>1 (split-K): zig-zag enables only LHS reuse within rows.
+    let use_zigzag_actual = use_zigzag && tiles_w > 1 && has_any_lhs;
 
-    // For small number of tiles, traversal order doesn't matter much
-    if total_tiles <= 4 {
-        return None;
+    if !use_zigzag_actual {
+        // === RASTER ORDER: every spatial tile independently loads LHS+RHS ===
+        // LHS is NOT kept resident across tiles in raster order.
+        let lat_per_tile = if k_steps == 1 {
+            compute_per_kstep.max(
+                (total_lhs_full + rhs_strips_total + out_slice + pointwise_boundary) as f64 / bw,
+            )
+        } else {
+            let lat_step1 = compute_per_kstep.max((total_lhs_full + rhs_strips_total) as f64 / bw);
+            let lat_middle = compute_per_kstep.max(rhs_strips_total as f64 / bw);
+            let lat_last = compute_per_kstep
+                .max((rhs_strips_total + out_slice + pointwise_boundary) as f64 / bw);
+            lat_step1 + (k_steps - 2) as f64 * lat_middle + lat_last
+        };
+        return total_spatial as f64 * lat_per_tile;
     }
 
-    // Generate zig-zag (snake) pattern: row 0: 0,1,2... row 1: ...2,1,0
-    let mut order = Vec::new();
+    // === ZIG-ZAG ORDER: LHS reuse within rows ===
+    // Traversal: row-major zig-zag (snake pattern).
+    // Within a row: first tile of each row loads ALL LHS tensors, subsequent tiles reuse them.
+    // Row transition: reload all LHS tensors (new h-strip).
+
+    if k_steps == 1 {
+        // k_steps==1: also enables RHS reuse across row transitions.
+        // lat_row_change: reload all LHS, keep last RHS from previous row's last col.
+        // lat_col_change: keep all LHS, load new RHS.
+        // Pointwise boundary is loaded per tile (every tile writes output + runs Pointwise).
+        let lat_full = compute_per_kstep.max(
+            (total_lhs_full + first_rhs_strip + out_slice + pointwise_boundary) as f64 / bw,
+        );
+        let lat_row_change = compute_per_kstep
+            .max((total_lhs_full + out_slice + pointwise_boundary) as f64 / bw);
+        let lat_col_change = compute_per_kstep
+            .max((first_rhs_strip + out_slice + pointwise_boundary) as f64 / bw);
+        return 1.0 * lat_full
+            + (tiles_h - 1) as f64 * lat_row_change
+            + (tiles_h * (tiles_w - 1)) as f64 * lat_col_change;
+    }
+
+    // k_steps>1: LHS reuse within rows only; no RHS reuse across row transitions.
+    // Pointwise boundary is loaded in the last k-step (when output is written).
+    let lat_step1_with_lhs = compute_per_kstep.max((total_lhs_full + rhs_strips_total) as f64 / bw);
+    let lat_step1_no_lhs = compute_per_kstep.max(rhs_strips_total as f64 / bw);
+    let lat_middle = compute_per_kstep.max(rhs_strips_total as f64 / bw);
+    let lat_last =
+        compute_per_kstep.max((rhs_strips_total + out_slice + pointwise_boundary) as f64 / bw);
+    // First tile in each row: load LHS_full + RHS_strips in step1
+    let lat_first_tile = lat_step1_with_lhs + (k_steps - 2) as f64 * lat_middle + lat_last;
+    // Subsequent tiles in same row: LHS already resident → step1 is lat_step1_no_lhs
+    let lat_rest_tile = lat_step1_no_lhs + (k_steps - 2) as f64 * lat_middle + lat_last;
+    let lat_per_row = lat_first_tile + (tiles_w - 1) as f64 * lat_rest_tile;
+    tiles_h as f64 * lat_per_row
+}
+
+// ===== TRAVERSAL ORDER GENERATION =====
+
+/// Generate zig-zag (snake) traversal order for a grid of tiles_h × tiles_w.
+/// Returns None if single tile (no optimization needed).
+pub fn gen_zigzag_order(tiles_h: i64, tiles_w: i64) -> Option<Vec<i64>> {
+    if tiles_h <= 1 && tiles_w <= 1 {
+        return None;
+    }
+    let mut order = Vec::with_capacity((tiles_h * tiles_w) as usize);
     for row in 0..tiles_h {
         if row % 2 == 0 {
-            // Left to right
             for col in 0..tiles_w {
-                order.push((row * tiles_w + col) as i64);
+                order.push(row * tiles_w + col);
             }
         } else {
-            // Right to left
             for col in (0..tiles_w).rev() {
-                order.push((row * tiles_w + col) as i64);
+                order.push(row * tiles_w + col);
             }
         }
     }
-
     Some(order)
 }
 
-/// Helper: Compute latency for a grouped subgraph with granularity and traversal order
-fn compute_group_latency_with_granularity(
+// ===== GRANULARITY SEARCH =====
+
+/// Find the best granularity [w, h, k] for a subgraph that:
+/// 1. Keeps working set ≤ fast_memory_capacity
+/// 2. Minimizes total latency
+///
+/// Returns (granularity, traversal_order, latency)
+pub fn find_best_granularity(
     problem: &Problem,
     ops: &[usize],
-    granularity: [i64; 3],
-    traversal_order: &Option<Vec<i64>>,
-) -> f64 {
-    let [w, h, k] = granularity;
-    let bandwidth = problem.slow_memory_bandwidth as f64;
+    resident_tensors: &HashSet<usize>,
+) -> ([i64; 3], Option<Vec<i64>>, f64) {
     let native_w = problem.native_granularity[0];
     let native_h = problem.native_granularity[1];
+    let cap = problem.fast_memory_capacity;
 
-    // Total compute time = sum of all op costs
-    let mut compute_time: f64 = ops.iter()
-        .map(|&op_idx| problem.base_costs[op_idx] as f64)
-        .sum();
+    // Determine output dimensions
+    let out_tensor = primary_output_tensor(problem, ops);
+    let out_w = problem.widths[out_tensor];
+    let out_h = problem.heights[out_tensor];
 
-    // Find boundary tensors
-    let mut produced_tensors = HashSet::new();
-    let mut consumed_tensors = HashSet::new();
+    let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
 
-    for &op_idx in ops {
-        for &out_tid in &problem.outputs[op_idx] {
-            produced_tensors.insert(out_tid);
-        }
-        for &in_tid in &problem.inputs[op_idx] {
-            consumed_tensors.insert(in_tid);
-        }
-    }
-
-    // Compute memory time accounting for traversal order optimization
-    let mut memory_time_in = 0.0;
-    
-    // If we have traversal order, we can reuse data between tiles
-    let has_traversal_opt = traversal_order.is_some() && 
-                            ops.iter().any(|&op_idx| problem.op_types[op_idx] == "MatMul");
-    
-    if has_traversal_opt {
-        // With zig-zag traversal, we can reuse row/column strips
-        // Simplified model: assume 50% data reuse on average
-        for &tensor_id in &consumed_tensors {
-            if !produced_tensors.contains(&tensor_id) {
-                let tensor_w = problem.widths[tensor_id];
-                let tensor_h = problem.heights[tensor_id];
-                let tiles = num_tiles(tensor_w, tensor_h, w, h);
-                let tile_size = w * h;
-                // Assume 50% reuse with zig-zag pattern
-                memory_time_in += (tiles * tile_size * 3 / 4) as f64 / bandwidth;
-            }
-        }
+    // Find K_full for MatMul ops
+    let k_full = if has_matmul {
+        let matmul_op = *ops.iter().find(|&&op| problem.op_types[op] == "MatMul").unwrap();
+        matmul_k_full(problem, matmul_op)
     } else {
-        // Standard case: no traversal optimization
-        for &tensor_id in &consumed_tensors {
-            if !produced_tensors.contains(&tensor_id) {
-                let tensor_w = problem.widths[tensor_id];
-                let tensor_h = problem.heights[tensor_id];
-                let tiles = num_tiles(tensor_w, tensor_h, w, h);
-                let tile_size = w * h;
-                memory_time_in += (tiles * tile_size) as f64 / bandwidth;
-            }
-        }
-    }
+        1
+    };
 
-    // Graph outputs: produced but not consumed by this group
-    let mut memory_time_out = 0.0;
-    for &tensor_id in &produced_tensors {
-        if !consumed_tensors.contains(&tensor_id) {
-            let tensor_w = problem.widths[tensor_id];
-            let tensor_h = problem.heights[tensor_id];
-            let tiles = num_tiles(tensor_w, tensor_h, w, h);
-            let tile_size = w * h;
-            memory_time_out += (tiles * tile_size) as f64 / bandwidth;
-        }
-    }
+    // Generate candidate w values: multiples of native_w that divide the output range
+    // Also include sub-native candidates for tight memory situations
+    let w_candidates = gen_dimension_candidates(out_w, native_w);
+    let h_candidates = gen_dimension_candidates(out_h, native_h);
 
-    // Account for tiling overhead: if granularity < native, we pay native cost per tile
-    let last_op = ops[ops.len() - 1];
-    let out_tid = problem.outputs[last_op][0];
-    let out_w = problem.widths[out_tid];
-    let out_h = problem.heights[out_tid];
-    
-    let tiles_needed = num_tiles(out_w, out_h, w, h);
-    
-    // If we're tiling smaller than native, we still pay native compute cost per tile
-    if w < native_w || h < native_h {
-        // Compute cost is paid per native tile, but we produce fewer elements
-        // Simplified: scale compute time by tile ratio
-        let native_tiles = num_tiles(out_w, out_h, native_w, native_h);
-        if native_tiles > 0 {
-            compute_time = compute_time * (tiles_needed as f64 / native_tiles as f64);
-        }
-    }
+    // Generate k candidates: from k_full down to native_w (or 1 if smaller)
+    let k_candidates: Vec<i64> = if has_matmul {
+        gen_k_candidates(k_full, native_w)
+    } else {
+        vec![1]
+    };
 
-    // For split-K MatMul: multiply compute by number of k-steps
-    if k < get_matmul_k(problem, ops[0]) {
-        let full_k = get_matmul_k(problem, ops[0]);
-        let k_steps = (full_k + k - 1) / k;
-        compute_time *= k_steps as f64;
-    }
+    let mut best_gran = [native_w.min(out_w), native_h.min(out_h), k_full.min(1i64.max(native_w))];
+    let mut best_lat = f64::INFINITY;
+    let mut best_traversal: Option<Vec<i64>> = None;
 
-    let total_memory_time = memory_time_in + memory_time_out;
-    compute_time.max(total_memory_time)
-}
+    // For each combination, find feasible ones and pick best latency
+    // Strategy: try k from largest to smallest (prefer no split-K)
+    // For each k, try largest (w, h) that fits
+    for &k in k_candidates.iter().rev() {
+        for &w in w_candidates.iter().rev() {
+            for &h in h_candidates.iter().rev() {
+                let gran = [w, h, k];
+                let ws = compute_working_set(problem, ops, gran);
+                if ws > cap {
+                    continue; // doesn't fit
+                }
 
-/// Helper: Build graph structure to understand dependencies
-fn build_graph(problem: &Problem) -> (Vec<usize>, HashMap<usize, Vec<usize>>, HashMap<usize, usize>) {
-    let n_ops = problem.op_types.len();
-    let mut in_degree = vec![0; n_ops];
-    let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut tensor_to_producer: HashMap<usize, usize> = HashMap::new();
+                // Try with and without zigzag
+                let tiles_w = ceil_div(out_w, w);
+                let tiles_h = ceil_div(out_h, h);
 
-    // Build dependency graph
-    for op_idx in 0..n_ops {
-        for &out_tid in &problem.outputs[op_idx] {
-            tensor_to_producer.insert(out_tid, op_idx);
-        }
-    }
+                // Raster order
+                let lat_raster = compute_latency(problem, ops, gran, false, resident_tensors);
+                if lat_raster < best_lat {
+                    best_lat = lat_raster;
+                    best_gran = gran;
+                    best_traversal = None;
+                }
 
-    for op_idx in 0..n_ops {
-        for &in_tid in &problem.inputs[op_idx] {
-            if let Some(&producer) = tensor_to_producer.get(&in_tid) {
-                in_degree[op_idx] += 1;
-                consumers.entry(producer).or_insert_with(Vec::new).push(op_idx);
-            }
-        }
-    }
-
-    // Topological sort
-    let mut queue = std::collections::VecDeque::new();
-    for op_idx in 0..n_ops {
-        if in_degree[op_idx] == 0 {
-            queue.push_back(op_idx);
-        }
-    }
-
-    let mut topo_order = Vec::new();
-    while let Some(op_idx) = queue.pop_front() {
-        topo_order.push(op_idx);
-        if let Some(consumers_list) = consumers.get(&op_idx) {
-            for &consumer in consumers_list {
-                in_degree[consumer] -= 1;
-                if in_degree[consumer] == 0 {
-                    queue.push_back(consumer);
+                // Zig-zag order: enables LHS reuse within rows (always), and
+                // also RHS reuse across row transitions when k_steps==1.
+                // Beneficial whenever there are multiple column tiles (tiles_w > 1).
+                if has_matmul && tiles_w > 1 {
+                    let lat_zz = compute_latency(problem, ops, gran, true, resident_tensors);
+                    if lat_zz < best_lat {
+                        best_lat = lat_zz;
+                        best_gran = gran;
+                        best_traversal = gen_zigzag_order(tiles_h, tiles_w);
+                    }
                 }
             }
         }
     }
 
-    (topo_order, consumers, tensor_to_producer)
-}
-
-/// Helper: Count how many times each tensor is used
-fn count_tensor_usage(problem: &Problem) -> HashMap<usize, usize> {
-    let mut usage_count = HashMap::new();
-    for op_idx in 0..problem.op_types.len() {
-        for &tensor_id in &problem.inputs[op_idx] {
-            *usage_count.entry(tensor_id).or_insert(0) += 1;
+    // Emergency fallback: try smallest possible tile
+    if best_lat.is_infinite() {
+        // Try minimum tile sizes
+        for k in (1..=k_full).rev().step_by(1) {
+            let w = native_w.min(out_w);
+            let h = native_h.min(out_h);
+            let gran = [w, h, k];
+            let ws = compute_working_set(problem, ops, gran);
+            if ws <= cap {
+                let lat = compute_latency(problem, ops, gran, false, resident_tensors);
+                best_gran = gran;
+                best_lat = lat;
+                best_traversal = None;
+                break;
+            }
+        }
+        // If still doesn't fit, use sub-native tiles
+        if best_lat.is_infinite() {
+            let mut w = native_w.min(out_w);
+            let mut h = native_h.min(out_h);
+            loop {
+                let gran = [w, h, 1i64.max(k_full / 64)];
+                let ws = compute_working_set(problem, ops, gran);
+                if ws <= cap {
+                    let lat = compute_latency(problem, ops, gran, false, resident_tensors);
+                    best_gran = gran;
+                    best_lat = lat;
+                    break;
+                }
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+                if w == 1 && h == 1 {
+                    break;
+                }
+            }
         }
     }
-    usage_count
+
+    (best_gran, best_traversal, best_lat)
 }
 
-/// Helper: Compute cost of recomputing a tensor vs retaining it
-/// Returns (recompute_cost, retain_cost)
-fn compute_recompute_vs_retain_cost(
-    problem: &Problem,
-    tensor_id: usize,
-    producer_op: usize,
-) -> (f64, f64) {
-    let size = tensor_size(problem, tensor_id) as f64;
-    let bandwidth = problem.slow_memory_bandwidth as f64;
-    
-    // Cost to recompute: compute cost of producer op + input memory cost
-    let mut recompute_cost = problem.base_costs[producer_op] as f64;
-    for &in_tid in &problem.inputs[producer_op] {
-        let in_size = tensor_size(problem, in_tid) as f64;
-        recompute_cost += in_size / bandwidth;
+/// Generate candidate tile widths/heights.
+/// Includes: multiples of native up to tensor dim, and sub-native powers of 2.
+fn gen_dimension_candidates(tensor_dim: i64, native: i64) -> Vec<i64> {
+    let mut candidates: HashSet<i64> = HashSet::new();
+
+    // Sub-native candidates (needed when memory is tight)
+    let mut sub = native;
+    while sub >= 1 {
+        candidates.insert(sub.min(tensor_dim));
+        sub /= 2;
     }
-    
-    // Cost to retain: memory transfer cost (load once, keep in fast memory)
-    // Plus opportunity cost of using fast memory capacity
-    let retain_cost = size / bandwidth;
-    
-    (recompute_cost, retain_cost)
+    candidates.insert(1);
+
+    // Native multiples up to tensor_dim
+    let mut n = native;
+    while n <= tensor_dim {
+        candidates.insert(n);
+        n += native;
+    }
+    candidates.insert(tensor_dim); // always include full dim
+
+    let mut v: Vec<i64> = candidates.into_iter().filter(|&x| x > 0).collect();
+    v.sort();
+    v
 }
 
-/// Main scheduler with all optimizations
-pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
+/// Generate candidate k values: from k_full down in powers-of-2 and native-size steps.
+fn gen_k_candidates(k_full: i64, native: i64) -> Vec<i64> {
+    let mut candidates: HashSet<i64> = HashSet::new();
+    candidates.insert(k_full);
+
+    // Powers of 2 divisions of k_full
+    let mut k = k_full;
+    while k >= 1 {
+        candidates.insert(k);
+        k /= 2;
+    }
+
+    // Native-size multiples down
+    let mut kn = native;
+    while kn <= k_full {
+        candidates.insert(kn);
+        kn += native;
+    }
+    candidates.insert(1);
+
+    let mut v: Vec<i64> = candidates.into_iter().filter(|&x| x > 0).collect();
+    v.sort();
+    v
+}
+
+// ===== GRAPH STRUCTURE =====
+
+pub struct GraphInfo {
+    pub topo_order: Vec<usize>,
+    pub consumers: HashMap<usize, Vec<usize>>,
+    pub tensor_to_producer: HashMap<usize, usize>,
+    pub tensor_usage_count: HashMap<usize, usize>,
+}
+
+pub fn build_graph(problem: &Problem) -> GraphInfo {
     let n_ops = problem.op_types.len();
-    
-    // Build graph structure
-    let (topo_order, consumers, _tensor_to_producer) = build_graph(problem);
-    let tensor_usage = count_tensor_usage(problem);
+    let mut in_degree = vec![0usize; n_ops];
+    let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut tensor_to_producer: HashMap<usize, usize> = HashMap::new();
+    let mut tensor_usage_count: HashMap<usize, usize> = HashMap::new();
 
-    let mut subgraphs = Vec::new();
-    let mut granularities = Vec::new();
-    let mut tensors_to_retain = Vec::new();
-    let mut traversal_orders = Vec::new();
-    let mut subgraph_latencies = Vec::new();
+    for op in 0..n_ops {
+        for &t in &problem.outputs[op] {
+            tensor_to_producer.insert(t, op);
+        }
+    }
 
-    // Track which ops are scheduled
+    for op in 0..n_ops {
+        for &t in &problem.inputs[op] {
+            *tensor_usage_count.entry(t).or_insert(0) += 1;
+            if let Some(&producer) = tensor_to_producer.get(&t) {
+                in_degree[op] += 1;
+                consumers.entry(producer).or_default().push(op);
+            }
+        }
+    }
+
+    // Topological sort (Kahn's algorithm)
+    let mut queue: VecDeque<usize> = (0..n_ops).filter(|&op| in_degree[op] == 0).collect();
+    let mut topo_order = Vec::new();
+    let mut deg = in_degree.clone();
+
+    while let Some(op) = queue.pop_front() {
+        topo_order.push(op);
+        if let Some(cons) = consumers.get(&op) {
+            for &c in cons {
+                deg[c] -= 1;
+                if deg[c] == 0 {
+                    queue.push_back(c);
+                }
+            }
+        }
+    }
+
+    GraphInfo {
+        topo_order,
+        consumers,
+        tensor_to_producer,
+        tensor_usage_count,
+    }
+}
+
+// ===== TENSORS TO RETAIN =====
+
+/// Decide which output tensors of a subgraph to retain in fast memory.
+/// A tensor is worth retaining if the next scheduled subgraph uses it
+/// (avoids write + future re-load costs).
+///
+/// Constraints:
+/// - Retained tensors must fit in fast memory alongside the NEXT subgraph's working set
+/// - Only retain if it provides latency benefit
+fn decide_retain(
+    problem: &Problem,
+    current_ops: &[usize],
+    current_gran: [i64; 3],
+    next_subgraph_ops: Option<&[usize]>,
+    next_gran: Option<[i64; 3]>,
+    graph: &GraphInfo,
+) -> Vec<usize> {
+    let [w, h, _k] = current_gran;
+    let bw = problem.slow_memory_bandwidth as f64;
+    let cap = problem.fast_memory_capacity;
+
+    // Collect output tensors of current subgraph that are used by the next
+    let dummy_producer: HashMap<usize, usize> = HashMap::new();
+    let (_, final_outputs) = classify_boundary(problem, current_ops, &dummy_producer);
+
+    let next_ops = match next_subgraph_ops {
+        Some(ops) => ops,
+        None => return vec![], // last subgraph, no need to retain
+    };
+
+    let (next_boundary_inputs, _) = classify_boundary(problem, next_ops, &dummy_producer);
+    let next_input_set: HashSet<usize> = next_boundary_inputs.iter().cloned().collect();
+
+    // Only consider retaining tensors needed by the next subgraph
+    let candidates: Vec<usize> = final_outputs
+        .iter()
+        .filter(|&&t| next_input_set.contains(&t))
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    // Check if retaining fits in fast memory for the next subgraph
+    let next_gran_val = match next_gran {
+        Some(g) => g,
+        None => return vec![],
+    };
+
+    let next_ws = compute_working_set(problem, next_ops, next_gran_val);
+    let mut available = cap - next_ws;
+    if available <= 0 {
+        return vec![];
+    }
+
+    let mut retained = Vec::new();
+    for &t in &candidates {
+        let tensor_size = problem.widths[t] * problem.heights[t];
+
+        // Benefit: save write cost (eviction) + save future load cost
+        let save_write = (w * h) as f64 / bw; // approximate: size of one tile write... actually full tensor
+        let save_load = tensor_size as f64 / bw;
+        let benefit = save_write + save_load;
+
+        // Cost: occupy fast memory (may cause higher granularity constraints for next)
+        // For simplicity: retain if it fits
+        if tensor_size <= available && benefit > 0.0 {
+            retained.push(t);
+            available -= tensor_size;
+        }
+    }
+
+    retained
+}
+
+// ===== MAIN SCHEDULER =====
+
+pub fn scheduler_solution(problem: &Problem) -> Result<Solution> {
+    let graph = build_graph(problem);
+    let n_ops = problem.op_types.len();
+
+    let mut subgraphs: Vec<Vec<usize>> = Vec::new();
+    let mut granularities: Vec<[i64; 3]> = Vec::new();
+    let mut tensors_to_retain: Vec<Vec<usize>> = Vec::new();
+    let mut traversal_orders: Vec<Option<Vec<i64>>> = Vec::new();
+    let mut subgraph_latencies: Vec<f64> = Vec::new();
+
     let mut scheduled = vec![false; n_ops];
-    
-    // More aggressive grouping: try to form larger groups with look-ahead
-    for &op_idx in &topo_order {
-        if scheduled[op_idx] {
+    let mut resident_tensors: HashSet<usize> = HashSet::new();
+
+    // Build all subgraphs first (grouping phase), then compute latencies
+    let mut all_groups: Vec<Vec<usize>> = Vec::new();
+
+    for &op in &graph.topo_order {
+        if scheduled[op] {
             continue;
         }
 
-        // Try to build a group starting from this op
-        let mut current_group = vec![op_idx];
-        scheduled[op_idx] = true;
+        let mut group = vec![op];
+        scheduled[op] = true;
 
-        // Try to extend the group greedily with look-ahead
-        loop {
-            let mut extended = false;
-            
-            // Collect all candidate consumers first (to avoid borrow issues)
-            let mut candidates = Vec::new();
-            for &group_op in &current_group {
-                if let Some(consumer_list) = consumers.get(&group_op) {
-                    for &consumer in consumer_list {
-                        if !scheduled[consumer] {
-                            candidates.push(consumer);
+        // Try to extend the group greedily
+        // Use beam search: keep top-K candidates
+        'extend: loop {
+            let mut best_candidate: Option<usize> = None;
+            let mut best_lat = f64::INFINITY;
+
+            // Collect all schedulable consumers of ops in current group
+            let mut candidates: Vec<usize> = Vec::new();
+            for &gop in &group {
+                if let Some(cons) = graph.consumers.get(&gop) {
+                    for &c in cons {
+                        if !scheduled[c] && !candidates.contains(&c) {
+                            // Check if ALL predecessors of c are in the group or already scheduled
+                            let all_preds_ready = problem.inputs[c].iter().all(|&t| {
+                                if let Some(&producer) = graph.tensor_to_producer.get(&t) {
+                                    scheduled[producer] || group.contains(&producer)
+                                } else {
+                                    true // graph input
+                                }
+                            });
+                            if all_preds_ready {
+                                candidates.push(c);
+                            }
                         }
                     }
                 }
             }
-            
-            // Sort candidates by potential benefit (look-ahead heuristic)
-            // Prefer ops that allow further grouping
-            candidates.sort_by_key(|&consumer| {
-                let mut lookahead_score = 0;
-                if let Some(consumer_list) = consumers.get(&consumer) {
-                    lookahead_score = consumer_list.len();
-                }
-                // Negative for max-heap behavior (we want more consumers first)
-                -(lookahead_score as i32)
-            });
-            
-            // Try each candidate
-            for consumer in candidates {
-                let mut candidate = current_group.clone();
-                candidate.push(consumer);
 
-                let (_granularity, working_set) = find_best_granularity(problem, &candidate);
-                
-                if working_set <= problem.fast_memory_capacity {
-                    current_group = candidate;
-                    scheduled[consumer] = true;
-                    extended = true;
-                    break;
+            if candidates.is_empty() {
+                break 'extend;
+            }
+
+            // Try each candidate: pick the one that gives best latency improvement
+            for &candidate in &candidates {
+                let mut trial = group.clone();
+                trial.push(candidate);
+
+                // Quick feasibility: minimum working set is with tile [1,1,1]
+                // n_boundary_inputs × 1 + 1 (output) → always tiny. Just allow it.
+                // The full search in find_best_granularity handles OOM cases.
+
+                let (trial_gran, trial_traversal, trial_lat) =
+                    find_best_granularity(problem, &trial, &resident_tensors);
+
+                if trial_lat < best_lat {
+                    best_lat = trial_lat;
+                    best_candidate = Some(candidate);
                 }
             }
 
-            if !extended {
-                break;
+            // Compare: is adding the best candidate better than not adding it?
+            if let Some(c) = best_candidate {
+                let (solo_gran, _, solo_lat) =
+                    find_best_granularity(problem, &group, &resident_tensors);
+
+                // Estimate cost of running c separately after the group
+                let (c_gran, _, c_lat) =
+                    find_best_granularity(problem, &[c], &resident_tensors);
+
+                // Adding c to group is beneficial if group_lat_with_c < group_lat + c_lat
+                // i.e., it saves latency
+                if best_lat < solo_lat + c_lat {
+                    group.push(c);
+                    scheduled[c] = true;
+                } else {
+                    break 'extend;
+                }
+            } else {
+                break 'extend;
             }
         }
 
-        // Finalize this group
-        let (granularity, _working_set) = find_best_granularity(problem, &current_group);
-        
-        // Generate optimal traversal order
-        let traversal_order = generate_traversal_order(problem, &current_group, granularity);
-        
-        let latency = compute_group_latency_with_granularity(
-            problem, 
-            &current_group, 
-            granularity,
-            &traversal_order
+        all_groups.push(group);
+    }
+
+    // Post-process: merge consecutive groups if it reduces total latency.
+    // The greedy forward pass can't look ahead past a "worse" intermediate state,
+    // so this catch-up pass handles cases where merging across group boundaries helps.
+    let mut merge_improved = true;
+    while merge_improved {
+        merge_improved = false;
+        let mut i = 0;
+        while i + 1 < all_groups.len() {
+            let mut merged = all_groups[i].clone();
+            merged.extend_from_slice(&all_groups[i + 1]);
+            let empty_resident: HashSet<usize> = HashSet::new();
+            let (_, _, lat_merged) = find_best_granularity(problem, &merged, &empty_resident);
+            let (_, _, lat_i) = find_best_granularity(problem, &all_groups[i], &empty_resident);
+            let (_, _, lat_i1) = find_best_granularity(problem, &all_groups[i + 1], &empty_resident);
+            if lat_merged < lat_i + lat_i1 - 1e-6 {
+                all_groups[i] = merged;
+                all_groups.remove(i + 1);
+                merge_improved = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // Now compute final granularities, latencies, and retain decisions
+    // Pass through all groups with resident tensor tracking
+    for (idx, group) in all_groups.iter().enumerate() {
+        let (gran, traversal, _lat) =
+            find_best_granularity(problem, group, &resident_tensors);
+
+        // Compute actual latency with resident tensors
+        let lat = compute_latency(
+            problem,
+            group,
+            gran,
+            traversal.is_some(),
+            &resident_tensors,
         );
 
-        // Determine tensors to retain (for skip connections)
-        // Use cost-based decision: recompute vs retain
-        let mut retain = Vec::new();
-        let mut remaining_capacity = problem.fast_memory_capacity;
-        
-        // Collect candidate tensors with their costs
-        let mut candidates = Vec::new();
-        for &op_idx in &current_group {
-            for &out_tid in &problem.outputs[op_idx] {
-                if let Some(&usage) = tensor_usage.get(&out_tid) {
-                    if usage > 1 {
-                        let (recompute_cost, retain_cost) = 
-                            compute_recompute_vs_retain_cost(problem, out_tid, op_idx);
-                        let size = tensor_size(problem, out_tid);
-                        
-                        candidates.push((out_tid, size, recompute_cost, retain_cost, usage));
-                    }
-                }
+        // Decide what to retain for next subgraph
+        let next_ops = all_groups.get(idx + 1).map(|g| g.as_slice());
+        let next_gran = if let Some(nops) = next_ops {
+            let (ng, _, _) = find_best_granularity(problem, nops, &HashSet::new());
+            Some(ng)
+        } else {
+            None
+        };
+
+        let retain = decide_retain(problem, group, gran, next_ops, next_gran, &graph);
+
+        // Update resident tensors for next subgraph
+        // Remove all tensors that are no longer resident (evicted)
+        // Add newly retained tensors
+        let dummy_producer: HashMap<usize, usize> = HashMap::new();
+        let (_, final_outputs) = classify_boundary(problem, group, &dummy_producer);
+        for &t in &final_outputs {
+            resident_tensors.remove(&t);
+        }
+        // Also remove tensors used as inputs that weren't retained
+        for &t in &problem.inputs.iter().flatten().cloned().collect::<HashSet<usize>>() {
+            if !retain.contains(&t) {
+                resident_tensors.remove(&t);
             }
         }
-        
-        // Sort by benefit: (recompute_cost - retain_cost) / size (benefit per unit memory)
-        candidates.sort_by(|a, b| {
-            let benefit_a = (a.2 - a.3) / (a.1 as f64 + 1.0);
-            let benefit_b = (b.2 - b.3) / (b.1 as f64 + 1.0);
-            benefit_b.partial_cmp(&benefit_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        
-        // Greedily retain tensors that provide benefit and fit
-        for (tensor_id, size, recompute_cost, retain_cost, _usage) in candidates {
-            if retain_cost < recompute_cost && size <= remaining_capacity {
-                retain.push(tensor_id);
-                remaining_capacity -= size;
-            }
+        for &t in &retain {
+            resident_tensors.insert(t);
         }
 
-        subgraphs.push(current_group);
-        granularities.push(granularity);
+        subgraphs.push(group.clone());
+        granularities.push(gran);
         tensors_to_retain.push(retain);
-        traversal_orders.push(traversal_order);
-        subgraph_latencies.push(latency);
+        traversal_orders.push(traversal);
+        subgraph_latencies.push(lat);
     }
 
     Ok(Solution {
