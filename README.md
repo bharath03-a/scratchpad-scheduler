@@ -189,6 +189,32 @@ print('${f}: latency={:.1f}, subgraphs={}'.format(sum(d['subgraph_latencies']), 
 done
 ```
 
+### Build Linux submission binary (cross-compile from macOS)
+
+```bash
+# One-time setup
+brew install FiloSottile/musl-cross/musl-cross
+rustup target add x86_64-unknown-linux-musl
+
+# Build static Linux binary
+cargo build --release --target x86_64-unknown-linux-musl
+# Output: target/x86_64-unknown-linux-musl/release/mlsys
+```
+
+### Package submission zip
+
+```bash
+# Run from repo root (source/ is referenced directly — no copy needed)
+zip MLSys2026_TrackA_1.zip \
+  submission/mlsys \
+  submission/writeup.pdf \
+  source/Cargo.toml \
+  source/src/main.rs \
+  source/src/problem.rs \
+  source/src/solution.rs \
+  source/src/scheduler.rs
+```
+
 ---
 
 ## Results

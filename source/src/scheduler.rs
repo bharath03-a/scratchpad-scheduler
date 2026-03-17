@@ -82,74 +82,87 @@ fn primary_output_tensor(problem: &Problem, ops: &[usize]) -> usize {
     problem.outputs[last_op][0]
 }
 
+// ===== TENSOR ROLE ANALYSIS =====
+
+/// Pre-computed boundary tensor roles for a subgraph.
+/// Shared between compute_working_set and compute_latency to avoid duplicating
+/// the produced/LHS/RHS/pointwise classification loops.
+struct SubgraphTensors {
+    /// Non-ephemeral MatMul LHS tensors: (tensor_id, K_full)
+    /// Each is kept fully resident in fast memory across all k-steps.
+    lhs: Vec<(usize, i64)>,
+    /// Non-ephemeral MatMul RHS tensor IDs (streamed k-strip per k-step)
+    rhs: Vec<usize>,
+    /// Non-MatMul boundary input tensor IDs (pointwise / extra inputs)
+    pointwise: Vec<usize>,
+    /// K_full of the first MatMul op (governs k_steps for the group)
+    k_full: i64,
+    has_matmul: bool,
+}
+
+impl SubgraphTensors {
+    fn analyze(problem: &Problem, ops: &[usize]) -> Self {
+        let produced: HashSet<usize> = ops.iter()
+            .flat_map(|&op| problem.outputs[op].iter().cloned())
+            .collect();
+
+        let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
+        let mut lhs = Vec::new();
+        let mut rhs = Vec::new();
+        let mut counted: HashSet<usize> = HashSet::new();
+
+        if has_matmul {
+            for &op in ops {
+                if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
+                    let lhs_id = problem.inputs[op][0];
+                    if !produced.contains(&lhs_id) && counted.insert(lhs_id) {
+                        lhs.push((lhs_id, problem.widths[lhs_id]));
+                    }
+                    let rhs_id = problem.inputs[op][1];
+                    if !produced.contains(&rhs_id) && counted.insert(rhs_id) {
+                        rhs.push(rhs_id);
+                    }
+                }
+            }
+        }
+
+        let mut pointwise = Vec::new();
+        for &op in ops {
+            for &t in &problem.inputs[op] {
+                if !produced.contains(&t) && counted.insert(t) {
+                    pointwise.push(t);
+                }
+            }
+        }
+
+        let k_full = if has_matmul {
+            let matmul_op = *ops.iter().find(|&&op| problem.op_types[op] == "MatMul").unwrap();
+            matmul_k_full(problem, matmul_op)
+        } else {
+            1
+        };
+
+        SubgraphTensors { lhs, rhs, pointwise, k_full, has_matmul }
+    }
+}
+
 // ===== WORKING SET COMPUTATION =====
 
 /// Compute the peak working set size in fast memory for one execution step.
-///
-/// Correct model (validated against problem examples):
-///
-/// For MatMul groups (including chains):
-///   - First boundary MatMul LHS: kept FULLY resident per spatial tile = h × K_full
-///     where K_full = problem.widths[lhs_tensor] (full reduction dimension)
-///   - Each boundary MatMul RHS: one k-strip at a time = k × w
-///   - Output accumulator: h × w
-///   - Any additional Pointwise boundary inputs: h × w each
-///
-/// For Pointwise-only groups:
-///   - Each boundary input: h × w
-///   - Output: h × w
 pub fn compute_working_set(problem: &Problem, ops: &[usize], gran: [i64; 3]) -> i64 {
     let [w, h, k] = gran;
+    let t = SubgraphTensors::analyze(problem, ops);
 
-    // Tensors produced within the group (ephemeral — never loaded from slow mem)
-    let produced: HashSet<usize> = ops.iter()
-        .flat_map(|&op| problem.outputs[op].iter().cloned())
-        .collect();
+    let mut ws = w * h; // output accumulator
 
-    // Output accumulator/tile
-    let mut ws: i64 = w * h;
-    let mut counted: HashSet<usize> = HashSet::new();
-
-    let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
-
-    if has_matmul {
-        // Find ALL boundary MatMul LHS tensors (not produced within the group).
-        // Each non-ephemeral LHS is kept fully resident (h × K_full) during k-steps.
-        // Multiple parallel chains in a merged group each need their own LHS resident.
-        for &op in ops {
-            if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
-                let lhs_id = problem.inputs[op][0];
-                if !produced.contains(&lhs_id) && !counted.contains(&lhs_id) {
-                    // LHS kept fully resident during k-steps: h × K_full
-                    // K_full = widths[lhs] (reduction dim)
-                    let k_full = problem.widths[lhs_id];
-                    ws += h * k_full;
-                    counted.insert(lhs_id);
-                    // No break: count ALL non-ephemeral LHS tensors
-                }
-            }
-        }
-
-        // Each boundary RHS: one k-strip at a time = k × w
-        for &op in ops {
-            if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
-                let rhs_id = problem.inputs[op][1];
-                if !produced.contains(&rhs_id) && !counted.contains(&rhs_id) {
-                    ws += k * w;
-                    counted.insert(rhs_id);
-                }
-            }
-        }
+    for (_, k_full_lhs) in &t.lhs {
+        ws += h * k_full_lhs; // LHS fully resident: h × K_full
     }
-
-    // Pointwise boundary inputs (and non-MatMul inputs): h × w tile each
-    for &op in ops {
-        for &t in &problem.inputs[op] {
-            if !produced.contains(&t) && !counted.contains(&t) {
-                ws += w * h;
-                counted.insert(t);
-            }
-        }
+    for _ in &t.rhs {
+        ws += k * w; // RHS k-strip per step
+    }
+    for _ in &t.pointwise {
+        ws += w * h; // pointwise tile
     }
 
     ws
@@ -185,7 +198,7 @@ pub fn compute_latency(
     let native_h = problem.native_granularity[1];
 
     let dummy_producer: HashMap<usize, usize> = HashMap::new();
-    let (boundary_inputs, final_outputs) = classify_boundary(problem, ops, &dummy_producer);
+    let (_, final_outputs) = classify_boundary(problem, ops, &dummy_producer);
 
     let out_tensor = primary_output_tensor(problem, ops);
     let out_w = problem.widths[out_tensor];
@@ -203,85 +216,42 @@ pub fn compute_latency(
     let base_cost: f64 = ops.iter().map(|&op| problem.base_costs[op] as f64).sum::<f64>()
         * native_tiles_per_spatial as f64;
 
-    let has_matmul = ops.iter().any(|&op| problem.op_types[op] == "MatMul");
+    let t = SubgraphTensors::analyze(problem, ops);
 
-    if !has_matmul {
+    if !t.has_matmul {
         // === POINTWISE-ONLY ===
-        // Count boundary inputs not already resident
-        let mem_in_per_tile: f64 = boundary_inputs
-            .iter()
-            .filter(|&&t| !resident_tensors.contains(&t))
+        let mem_in_per_tile: f64 = t.pointwise.iter()
+            .filter(|&&tid| !resident_tensors.contains(&tid))
             .count() as f64
-            * (w * h) as f64
-            / bw;
-
-        // Count final outputs (write to slow memory)
+            * (w * h) as f64 / bw;
         let mem_out_per_tile: f64 = final_outputs.len() as f64 * (w * h) as f64 / bw;
-
         let lat_per_tile = base_cost.max(mem_in_per_tile + mem_out_per_tile);
         return total_spatial as f64 * lat_per_tile;
     }
 
     // === MATMUL (or mixed MatMul+Pointwise) ===
-    let matmul_op = *ops.iter().find(|&&op| problem.op_types[op] == "MatMul").unwrap();
-    let k_full = matmul_k_full(problem, matmul_op);
-    let k_steps = ceil_div(k_full, k);
-
-    // Compute per k-step per spatial tile
+    let k_steps = ceil_div(t.k_full, k);
     let compute_per_kstep = base_cost / k_steps as f64;
-
     let out_slice = h * w;
 
-    // Tensors produced within the group (ephemeral — never loaded from slow mem)
-    let produced: HashSet<usize> = ops.iter()
-        .flat_map(|&op| problem.outputs[op].iter().cloned())
-        .collect();
+    // LHS: sum h × K_full for each non-resident LHS tensor
+    let total_lhs_full: i64 = t.lhs.iter()
+        .filter(|(tid, _)| !resident_tensors.contains(tid))
+        .map(|(_, k_full_lhs)| h * k_full_lhs)
+        .sum();
+    let has_any_lhs = !t.lhs.is_empty();
 
-    // ALL boundary MatMul LHS tensors: each loaded FULLY once per spatial tile = h × K_full
-    // (kept resident across all k-steps for that spatial tile).
-    // Multiple parallel chains in a merged group each contribute their LHS load cost.
-    // For zig-zag: all LHS tensors are reloaded at each new row, reused within a row.
-    let mut total_lhs_full: i64 = 0;
-    let mut has_any_lhs = false;
-    let mut counted_lat: HashSet<usize> = HashSet::new();
-    for &op in ops {
-        if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
-            let lhs_id = problem.inputs[op][0];
-            if !produced.contains(&lhs_id) && !counted_lat.contains(&lhs_id) {
-                if !resident_tensors.contains(&lhs_id) {
-                    total_lhs_full += h * problem.widths[lhs_id]; // h × K_full
-                }
-                has_any_lhs = true;
-                counted_lat.insert(lhs_id);
-                // No break: count ALL non-ephemeral LHS tensors
-            }
-        }
-    }
+    // RHS: k × w per strip; track first for zig-zag RHS-reuse formula
+    let rhs_strips_total: i64 = t.rhs.iter()
+        .map(|&tid| if resident_tensors.contains(&tid) { 0 } else { k * w })
+        .sum();
+    let first_rhs_strip: i64 = t.rhs.first()
+        .map(|&tid| if resident_tensors.contains(&tid) { 0 } else { k * w })
+        .unwrap_or(0);
 
-    // Sum all boundary RHS strips (k × w each, streamed per k-step)
-    let mut rhs_strips_total: i64 = 0;
-    let mut first_rhs_strip: i64 = 0;
-    let mut first_rhs_counted = false;
-    for &op in ops {
-        if problem.op_types[op] == "MatMul" && problem.inputs[op].len() >= 2 {
-            let rhs_id = problem.inputs[op][1];
-            if !produced.contains(&rhs_id) && !counted_lat.contains(&rhs_id) {
-                let rhs_eff = if resident_tensors.contains(&rhs_id) { 0 } else { k * w };
-                rhs_strips_total += rhs_eff;
-                if !first_rhs_counted {
-                    first_rhs_strip = rhs_eff;
-                    first_rhs_counted = true;
-                }
-                counted_lat.insert(rhs_id);
-            }
-        }
-    }
-
-    // Pointwise boundary inputs: loaded once per spatial tile (in last k-step with output)
-    // These are any boundary inputs not already counted as MatMul LHS or RHS.
-    let pointwise_boundary: i64 = boundary_inputs
-        .iter()
-        .filter(|&&t| !counted_lat.contains(&t) && !resident_tensors.contains(&t))
+    // Pointwise boundary: any non-LHS/RHS boundary inputs, loaded in the last k-step
+    let pointwise_boundary: i64 = t.pointwise.iter()
+        .filter(|&&tid| !resident_tensors.contains(&tid))
         .count() as i64
         * h * w;
 
