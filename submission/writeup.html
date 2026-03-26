@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,700;1,400&family=Roboto+Mono:wght@400&display=swap');
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Lora', 'Georgia', serif;
+    font-size: 10.3pt;
+    line-height: 1.58;
+    color: #1a1a1a;
+    background: #fff;
+    max-width: 680px;
+    margin: 0 auto;
+    padding: 52px 48px;
+  }
+
+  /* ── TITLE BLOCK ─────────────────────────────────────── */
+  .title-block {
+    text-align: center;
+    margin-bottom: 6px;
+  }
+
+  h1 {
+    font-family: 'Lora', 'Georgia', serif;
+    font-size: 19pt;
+    font-weight: 700;
+    color: #111;
+    line-height: 1.25;
+    margin-bottom: 8px;
+  }
+
+  .byline {
+    font-size: 9.5pt;
+    color: #444;
+    margin-bottom: 2px;
+  }
+
+  .header-rule {
+    border: none;
+    border-top: 1.5px solid #1a73e8;
+    margin: 14px 0 22px;
+  }
+
+  /* ── SECTION HEADERS ─────────────────────────────────── */
+  h2 {
+    font-family: 'Lora', 'Georgia', serif;
+    font-size: 9.5pt;
+    font-weight: 700;
+    color: #1a73e8;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-top: 24px;
+    margin-bottom: 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #d0d0d0;
+  }
+
+  /* ── BODY TEXT ───────────────────────────────────────── */
+  p {
+    text-align: justify;
+    margin-bottom: 9px;
+    hyphens: auto;
+  }
+
+  /* Phase lead-in bold */
+  p strong.phase {
+    font-weight: 700;
+    color: #111;
+  }
+
+  /* ── INLINE CODE ─────────────────────────────────────── */
+  code {
+    font-family: 'Roboto Mono', 'Courier New', monospace;
+    font-size: 8.5pt;
+    color: #c0392b;
+    background: none;
+  }
+
+  /* ── LISTS ───────────────────────────────────────────── */
+  ul {
+    margin: 6px 0 9px 20px;
+  }
+  li {
+    margin-bottom: 3px;
+    text-align: justify;
+    hyphens: auto;
+  }
+
+  /* ── PIPELINE DIAGRAM ────────────────────────────────── */
+  .pipeline-legend {
+    display: flex;
+    gap: 20px;
+    font-size: 8.5pt;
+    color: #444;
+    margin: 10px 0 8px;
+    align-items: center;
+  }
+  .legend-box {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 1px solid #999;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .legend-box.llm { background: #f5d87a; }
+  .legend-box.det { background: #c8e6c9; }
+
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin: 6px 0 16px;
+    font-size: 8pt;
+  }
+  .phase-box {
+    flex: 1;
+    border: 1px solid #bbb;
+    padding: 7px 6px;
+    text-align: center;
+    line-height: 1.4;
+  }
+  .phase-box.llm-phase  { background: #fef9e7; border-color: #f0c040; }
+  .phase-box.det-phase  { background: #f1f8f1; border-color: #81c784; }
+  .phase-box .phase-label {
+    font-weight: 700;
+    font-size: 7.5pt;
+    display: block;
+    color: #111;
+  }
+  .phase-box .phase-name {
+    font-size: 8.5pt;
+    font-weight: 700;
+    display: block;
+  }
+  .phase-box .phase-sub {
+    font-size: 7.5pt;
+    color: #555;
+    display: block;
+  }
+  .arrow {
+    display: flex;
+    align-items: center;
+    padding: 0 3px;
+    font-size: 11pt;
+    color: #666;
+  }
+
+  /* ── TABLES ──────────────────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0 14px;
+    font-size: 9pt;
+  }
+
+  thead tr { background: #1a73e8; }
+  thead th {
+    color: #fff;
+    font-weight: 700;
+    padding: 7px 10px;
+    text-align: left;
+    font-size: 9pt;
+    font-family: 'Lora', serif;
+  }
+
+  tbody tr:nth-child(even) { background: #f5f5f5; }
+  td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #e0e0e0;
+    vertical-align: top;
+  }
+  td code { font-size: 8pt; }
+  td.r { text-align: right; }
+  td.c { text-align: center; }
+  td.bold-r { text-align: right; font-weight: 700; color: #1a73e8; }
+
+  /* ── PRINT ───────────────────────────────────────────── */
+  @page {
+    size: A4;
+    margin: 14mm 12mm;
+  }
+
+  @media print {
+    body { padding: 0; max-width: 100%; }
+    h2 { page-break-after: avoid; }
+    table, .pipeline { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<!-- TITLE -->
+<div class="title-block">
+  <h1>Deterministic DAG Scheduler with Greedy Fusion<br>and Tile-Shape Co-optimization</h1>
+  <div class="byline">MLSys 2026 Competition &nbsp;·&nbsp; Track A: Systems Engineering &nbsp;·&nbsp; Bharath Velamala</div>
+</div>
+<hr class="header-rule">
+
+<!-- OVERVIEW -->
+<h2>Overview</h2>
+
+<p>
+  We present a purely deterministic scheduler for memory-constrained DAG workloads written in Rust.
+  The central design principle separates the two key decisions cleanly: a <strong>greedy fusion
+  pass</strong> decides which operations to group into subgraphs, while an <strong>exhaustive
+  granularity search</strong> selects the tile shape <code>[w, h, k]</code> that minimizes
+  roofline latency subject to fast-memory capacity constraints. A post-processing <strong>merge
+  pass</strong> then corrects look-ahead blindness in the greedy step by collapsing consecutive
+  subgraph pairs whenever fusion reduces total latency. All constraint checking—working-set
+  validation, split-K latency modeling, and zig-zag traversal—is handled analytically with
+  no heuristics.
+</p>
+
+<div class="pipeline-legend">
+  <span><span class="legend-box llm"></span> Greedy / search (no LLM)</span>
+  <span><span class="legend-box det"></span> Deterministic (analytical)</span>
+</div>
+
+<div class="pipeline">
+  <div class="phase-box llm-phase">
+    <span class="phase-label">PHASE 1</span>
+    <span class="phase-name">Tensor Analysis</span>
+    <span class="phase-sub">SubgraphTensors</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="phase-box llm-phase">
+    <span class="phase-label">PHASE 2</span>
+    <span class="phase-name">Greedy Grouping</span>
+    <span class="phase-sub">Topological order</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="phase-box det-phase">
+    <span class="phase-label">PHASE 3</span>
+    <span class="phase-name">Merge Pass</span>
+    <span class="phase-sub">Convergent pairs</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="phase-box det-phase">
+    <span class="phase-label">PHASE 4</span>
+    <span class="phase-name">Granularity Search</span>
+    <span class="phase-sub">[w, h, k] exhaustive</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="phase-box det-phase">
+    <span class="phase-label">PHASE 5</span>
+    <span class="phase-name">Retention + Output</span>
+    <span class="phase-sub">Tensor keep/evict</span>
+  </div>
+</div>
+
+<!-- ALGORITHM -->
+<h2>Algorithm</h2>
+
+<p>
+  <strong class="phase">Phase 1 — Tensor Role Analysis.</strong> For each candidate subgraph a
+  <code>SubgraphTensors</code> struct is computed in a single pass over the operator list.
+  It classifies every boundary input into one of three roles: MatMul LHS (kept fully resident
+  across all k-steps, size <code>h × K_full</code>), MatMul RHS (streamed one strip at a time,
+  size <code>k × w</code>), or Pointwise (one tile per spatial step, size <code>h × w</code>).
+  This shared analysis is consumed by both the working-set and latency functions,
+  eliminating duplicated classification loops.
+</p>
+
+<p>
+  <strong class="phase">Phase 2 — Greedy Subgraph Grouping.</strong> Ops are visited in
+  topological order. For each unscheduled op we build a candidate group by repeatedly
+  evaluating all schedulable consumers. A consumer <em>c</em> is added only if:
+</p>
+
+<ul>
+  <li>All of <em>c</em>'s producers are either already scheduled or in the current group</li>
+  <li><code>latency(group ∪ {c}) &lt; latency(group) + latency({c})</code></li>
+</ul>
+
+<p>
+  <strong class="phase">Phase 3 — Convergent Merge Pass.</strong> The greedy pass cannot look
+  past locally suboptimal intermediate states. Consider fusing ops 0–3 into group A and ops 4–7
+  into group B: adding op 4 to A produces a larger intermediate tensor that appears more
+  expensive, so the greedy pass stops—even though fusing all eight ops is optimal (the LHS is
+  loaded once per output row rather than once per group per row). The merge pass corrects this:
+  for every consecutive pair (A, B) it computes <code>latency(A ∪ B)</code> and replaces the pair
+  if the merged cost is lower. This repeats until no further improvement is found.
+</p>
+
+<p>
+  <strong class="phase">Phase 4 — Granularity Search.</strong> For each finalized subgraph the
+  scheduler exhaustively evaluates all <code>[w, h, k]</code> combinations drawn from multiples
+  of <code>[native_w, native_h]</code>, sub-native powers-of-two (for tight-memory cases), and
+  power-of-two subdivisions of <code>K_full</code>. Any combination whose peak working set exceeds
+  fast-memory capacity is pruned. Among feasible candidates both raster and zig-zag traversal
+  are evaluated; the one minimizing total roofline latency is selected.
+</p>
+
+<p>
+  <strong class="phase">Phase 5 — Tensor Retention.</strong> After each subgraph, output tensors
+  consumed by the immediately following subgraph are retained in fast memory if their full size
+  fits within <code>C − WS(next)</code>. Retention eliminates both the write-back and the future
+  reload of that tensor.
+</p>
+
+<!-- LATENCY AND MEMORY MODELS -->
+<h2>Latency and Working-Set Models</h2>
+
+<p>
+  Each execution step is governed by a roofline model:
+  <code>step_latency = max(compute_per_kstep, mem_bytes / bandwidth)</code>.
+  For a subgraph with <code>k_steps = ⌈K_full / k⌉</code> the three step types carry
+  different memory footprints:
+</p>
+
+<ul>
+  <li><strong>Step 1:</strong> load all non-resident LHS slices (<code>h × K_full</code> each)
+      + all RHS strips (<code>k × w</code> each)</li>
+  <li><strong>Middle steps:</strong> stream RHS strips only — LHS is held resident</li>
+  <li><strong>Last step:</strong> stream RHS strips + write output tile (<code>h × w</code>)
+      + load Pointwise inputs (<code>h × w</code> each)</li>
+</ul>
+
+<p>
+  When <code>tiles_w &gt; 1</code>, zig-zag (snake) traversal enables intra-subgraph data
+  reuse: LHS is loaded once at the first column tile and reused across all subsequent tiles in
+  that row. For <code>k_steps = 1</code>, the last RHS tile of the previous row is also reused
+  at the start of the next row. The exact zig-zag latency is:
+  <code>L = L<sub>full</sub> + (tiles_h − 1)·L<sub>row</sub> + tiles_h·(tiles_w − 1)·L<sub>col</sub></code>.
+</p>
+
+<p>
+  A critical correctness requirement for the working-set model: <em>every</em>
+  non-ephemeral LHS tensor must be counted, not just the first. In a subgraph formed by
+  fusing N independent MatMul chains, each chain contributes a fully-resident LHS. Counting
+  only one underestimates working-set size, admits infeasible schedules, and causes runtime
+  OOM errors. This is enforced uniformly across the granularity search, greedy pass, and
+  merge pass.
+</p>
+
+<!-- RESULTS -->
+<h2>Results on Released Benchmarks</h2>
+
+<p>
+  The baseline is a deterministic one-op-per-subgraph schedule with the algorithmically
+  optimal granularity per step—the conservative lower bound for each problem.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Problem</th>
+      <th>Ops</th>
+      <th>Fast Mem</th>
+      <th>Baseline Latency</th>
+      <th>Scheduler Latency</th>
+      <th>Subgraphs</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>mlsys-2026-1</td>
+      <td class="c">5</td>
+      <td class="c">60 K</td>
+      <td class="r">340,787</td>
+      <td class="r">340,787</td>
+      <td class="c">1</td>
+      <td class="c">1.00×</td>
+    </tr>
+    <tr>
+      <td>mlsys-2026-5</td>
+      <td class="c">19</td>
+      <td class="c">30 K</td>
+      <td class="r">459,084</td>
+      <td class="r">294,737</td>
+      <td class="c">1</td>
+      <td class="bold-r">1.56×</td>
+    </tr>
+    <tr>
+      <td>mlsys-2026-9</td>
+      <td class="c">32</td>
+      <td class="c">250 K</td>
+      <td class="r">6,118,638</td>
+      <td class="r">5,558,430</td>
+      <td class="c">1</td>
+      <td class="bold-r">1.10×</td>
+    </tr>
+    <tr>
+      <td>mlsys-2026-13</td>
+      <td class="c">63</td>
+      <td class="c">600 K</td>
+      <td class="r">—</td>
+      <td class="r">681,574</td>
+      <td class="c">17</td>
+      <td class="c">—</td>
+    </tr>
+    <tr>
+      <td>mlsys-2026-17</td>
+      <td class="c">103</td>
+      <td class="c">500 K</td>
+      <td class="r">—</td>
+      <td class="r">3,195,200</td>
+      <td class="c">56</td>
+      <td class="c">—</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  The scheduler's largest gains arise from the merge pass. On <strong>mlsys-2026-5</strong>
+  (19 ops, 30 KB fast memory) the pass collapses all 19 ops into a single subgraph,
+  achieving a 1.56× reduction by eliminating redundant slow-memory round trips for
+  intermediate tensors. On <strong>mlsys-2026-9</strong> (32 MatMul-heavy ops on
+  1024×1024 tensors) the same pass merges all 32 ops into one subgraph; the single
+  non-ephemeral LHS is loaded once per output row rather than once per original group,
+  yielding a further 9% reduction over greedy-only. On memory-tight problems
+  (<strong>mlsys-2026-13</strong>, 16 independent chains), each chain's LHS alone
+  occupies 87% of fast memory, making cross-chain fusion infeasible; the scheduler
+  correctly identifies this and produces 17 valid subgraphs with no OOM errors.
+</p>
+
+<!-- SUBMISSION DETAILS -->
+<h2>Submission Details</h2>
+
+<p>
+  <strong>Entry point</strong> (<code>mlsys</code>): accepts two positional arguments —
+  <code>mlsys &lt;input.json&gt; &lt;output.json&gt;</code>. The binary is statically
+  linked against musl libc and requires no runtime dependencies. All five benchmarks
+  complete within 9 seconds on commodity hardware, well inside the contest time limits.
+</p>
+
+<p>
+  <strong>Core modules</strong> (<code>source/src/</code>): <code>scheduler.rs</code> —
+  greedy grouping, merge pass, granularity search, zig-zag latency model, and tensor
+  retention (~860 lines, no unsafe code); <code>problem.rs</code> — JSON deserialization
+  of the problem spec; <code>solution.rs</code> — JSON serialization of the output schedule;
+  <code>main.rs</code> — CLI entry point.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Module</th>
+      <th>Responsibility</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SubgraphTensors::analyze</code></td>
+      <td>Single-pass LHS / RHS / Pointwise classification shared by WS and latency</td>
+    </tr>
+    <tr>
+      <td><code>compute_working_set</code></td>
+      <td>Peak fast-memory usage for a given <code>[w, h, k]</code>; rejects infeasible candidates</td>
+    </tr>
+    <tr>
+      <td><code>compute_latency</code></td>
+      <td>Exact split-K roofline with zig-zag traversal; asymmetric per-step costs</td>
+    </tr>
+    <tr>
+      <td><code>find_best_granularity</code></td>
+      <td>Exhaustive <code>[w, h, k]</code> search; emergency sub-native fallback</td>
+    </tr>
+    <tr>
+      <td><code>scheduler_solution</code></td>
+      <td>Greedy grouping → convergent merge pass → granularity assignment → retention</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  <strong>Dependencies</strong>: Rust standard library only; <code>anyhow</code> for error
+  propagation; <code>serde</code> + <code>serde_json</code> for I/O. Runtime: Rust 1.80,
+  target <code>x86_64-unknown-linux-musl</code>.
+</p>
+
+</body>
+</html>
